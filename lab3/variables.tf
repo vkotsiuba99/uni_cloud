@@ -1,6 +1,6 @@
 variable "machine_type" {
   description = "Azure VM size"
-  default     = "Standard_B1s"
+  default     = "Standard_D2als_v6"
 }
 
 variable "student_name" {
@@ -9,7 +9,7 @@ variable "student_name" {
 
 variable "location" {
   description = "Azure region"
-  default     = "northeurope"
+  default     = "westeurope"
 }
 
 variable "resource_group_name" {

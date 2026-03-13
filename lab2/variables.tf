@@ -1,6 +1,6 @@
 variable "machine_type" {
   description = "Azure VM size"
-  default     = "Standard_B1s"
+  default     = "Standard_D2als_v6"
 }
 variable "db_password" { default = "TestUs3r4!DB" }
 variable "student_name" { default = "Vladyslav Kotsiuba IM-52mp" }
@@ -9,7 +9,7 @@ variable "web_node_count" { default = 2 }
 
 variable "location" {
   description = "Azure region"
-  default     = "northeurope"
+  default     = "westeurope"
 }
 
 variable "resource_group_name" {
