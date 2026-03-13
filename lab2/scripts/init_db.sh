@@ -1,4 +1,7 @@
 #!/bin/bash
+while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 5; done
+while fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do sleep 5; done
+
 apt-get update
 # Install MySQL 8 and required utilities
 apt-get install -y mysql-server mysql-shell
