@@ -5,7 +5,7 @@ variable "machine_type" {
 variable "db_password" { default = "TestUs3r4!DB" }
 variable "student_name" { default = "Vladyslav Kotsiuba IM-52mp" }
 variable "db_node_count" { default = 3 }
-variable "web_node_count" { default = 2 }
+variable "web_node_count" { default = 1 }
 
 variable "location" {
   description = "Azure region"
