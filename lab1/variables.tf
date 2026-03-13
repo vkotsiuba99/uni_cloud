@@ -18,7 +18,7 @@ variable "web_server_count" {
 
 variable "location" {
   description = "Azure region"
-  default     = "westeurope"
+  default     = "northeurope"
 }
 
 variable "resource_group_name" {

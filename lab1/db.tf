@@ -1,11 +1,3 @@
-resource "azurerm_public_ip" "db_pip" {
-  name                = "lab1-db-pip"
-  location            = azurerm_resource_group.rg.location
-  resource_group_name = azurerm_resource_group.rg.name
-  allocation_method   = "Static"
-  sku                 = "Standard"
-}
-
 resource "azurerm_network_interface" "db_nic" {
   name                = "lab1-db-nic"
   location            = azurerm_resource_group.rg.location
@@ -15,7 +7,6 @@ resource "azurerm_network_interface" "db_nic" {
     name                          = "internal"
     subnet_id                     = azurerm_subnet.subnet.id
     private_ip_address_allocation = "Dynamic"
-    public_ip_address_id          = azurerm_public_ip.db_pip.id
   }
 }
 

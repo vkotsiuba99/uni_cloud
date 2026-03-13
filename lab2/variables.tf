@@ -9,7 +9,7 @@ variable "web_node_count" { default = 2 }
 
 variable "location" {
   description = "Azure region"
-  default     = "westeurope"
+  default     = "northeurope"
 }
 
 variable "resource_group_name" {

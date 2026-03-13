@@ -9,7 +9,7 @@ variable "student_name" {
 
 variable "location" {
   description = "Azure region"
-  default     = "westeurope"
+  default     = "northeurope"
 }
 
 variable "resource_group_name" {

@@ -1,12 +1,3 @@
-resource "azurerm_public_ip" "stor_pip" {
-  count               = 2
-  name                = "lab3-stor-pip-${count.index + 1}"
-  location            = azurerm_resource_group.rg.location
-  resource_group_name = azurerm_resource_group.rg.name
-  allocation_method   = "Static"
-  sku                 = "Standard"
-}
-
 resource "azurerm_network_interface" "stor_nic" {
   count               = 2
   name                = "lab3-stor-nic-${count.index + 1}"
@@ -17,7 +8,6 @@ resource "azurerm_network_interface" "stor_nic" {
     name                          = "internal"
     subnet_id                     = azurerm_subnet.subnet.id
     private_ip_address_allocation = "Dynamic"
-    public_ip_address_id          = azurerm_public_ip.stor_pip[count.index].id
   }
 }
 
