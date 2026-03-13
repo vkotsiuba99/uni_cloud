@@ -1,18 +1,6 @@
-variable "project_id" {
-  description = "ID of your project in GCP"
-  type        = string
-}
-
-variable "region" {
-  default = "us-central1"
-}
-
-variable "zone" {
-  default = "us-central1-a"
-}
-
 variable "machine_type" {
-  default = "e2-micro"
+  description = "Azure VM size"
+  default     = "Standard_B1s"
 }
 
 variable "db_password" {
@@ -26,4 +14,14 @@ variable "student_name" {
 variable "web_server_count" {
   description = "Number of web servers for horizontal scaling"
   default     = 2
+}
+
+variable "location" {
+  description = "Azure region"
+  default     = "westeurope"
+}
+
+variable "resource_group_name" {
+  description = "Azure resource group name"
+  default     = "uni-cloud-lab1-rg"
 }

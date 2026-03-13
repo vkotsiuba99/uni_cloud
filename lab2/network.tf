@@ -1,29 +1,60 @@
-resource "google_compute_network" "vpc_network" {
-  name                    = "lab2-network"
-  auto_create_subnetworks = true
+resource "azurerm_virtual_network" "vnet" {
+  name                = "lab2-vnet"
+  address_space       = ["10.1.0.0/16"]
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
 }
 
-resource "google_compute_firewall" "allow_all_internal" {
-  name    = "allow-all-internal"
-  network = google_compute_network.vpc_network.name
-  allow {
-    protocol = "tcp"
-  }
-  allow {
-    protocol = "udp"
-  }
-  allow {
-    protocol = "icmp"
-  }
-  source_ranges = ["10.128.0.0/9"] # Allow internal traffic for replication
+resource "azurerm_subnet" "subnet" {
+  name                 = "lab2-subnet"
+  resource_group_name  = azurerm_resource_group.rg.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = ["10.1.1.0/24"]
 }
 
-resource "google_compute_firewall" "allow_http_ssh" {
-  name    = "allow-http-ssh"
-  network = google_compute_network.vpc_network.name
-  allow {
-    protocol = "tcp"
-    ports    = ["22", "80"]
+resource "azurerm_network_security_group" "nsg" {
+  name                = "lab2-nsg"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  security_rule {
+    name                       = "allow-ssh"
+    priority                   = 100
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "22"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
   }
-  source_ranges = ["0.0.0.0/0"]
+
+  security_rule {
+    name                       = "allow-http"
+    priority                   = 110
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "80"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
+  }
+
+  security_rule {
+    name                       = "allow-mysql"
+    priority                   = 120
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "3306"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
+  }
+}
+
+resource "azurerm_subnet_network_security_group_association" "subnet_nsg" {
+  subnet_id                 = azurerm_subnet.subnet.id
+  network_security_group_id = azurerm_network_security_group.nsg.id
 }

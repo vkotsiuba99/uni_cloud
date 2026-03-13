@@ -1,22 +1,62 @@
-resource "google_compute_instance" "web" {
-  count        = var.web_server_count
-  name         = "vladyslav-kotsiuba-im52mp-web${count.index + 1}"
-  machine_type = var.machine_type
-  
-  boot_disk {
-    initialize_params { image = "debian-cloud/debian-12" }
+resource "azurerm_public_ip" "web_pip" {
+  count               = var.web_server_count
+  name                = "lab1-web-pip-${count.index + 1}"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  allocation_method   = "Static"
+  sku                 = "Basic"
+}
+
+resource "azurerm_network_interface" "web_nic" {
+  count               = var.web_server_count
+  name                = "lab1-web-nic-${count.index + 1}"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.subnet.id
+    private_ip_address_allocation = "Dynamic"
+    public_ip_address_id          = azurerm_public_ip.web_pip[count.index].id
+  }
+}
+
+resource "azurerm_linux_virtual_machine" "web" {
+  count               = var.web_server_count
+  name                = "vladyslav-kotsiuba-im52mp-web${count.index + 1}"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  size                = var.machine_type
+
+  admin_username                  = "azureuser"
+  disable_password_authentication = true
+
+  network_interface_ids = [
+    azurerm_network_interface.web_nic[count.index].id,
+  ]
+
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"
   }
 
-  network_interface {
-    network = google_compute_network.vpc_network.name
-    access_config {}
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-jammy"
+    sku       = "22_04-lts"
+    version   = "latest"
   }
 
-  metadata_startup_script = templatefile("${path.module}/scripts/init_web.sh", {
-    db_ip        = google_compute_instance.db.network_interface.0.network_ip
+  admin_ssh_key {
+    username   = "azureuser"
+    public_key = file("${path.module}/id_rsa.pub")
+  }
+
+  custom_data = base64encode(templatefile("${path.module}/scripts/init_web.sh", {
+    db_ip        = azurerm_network_interface.db_nic.ip_configuration[0].private_ip_address
     db_password  = var.db_password
     student_name = var.student_name
-  })
+  }))
 
-  depends_on = [google_compute_instance.db]
+  depends_on = [azurerm_linux_virtual_machine.db]
 }

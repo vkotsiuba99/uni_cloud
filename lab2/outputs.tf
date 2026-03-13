@@ -1,12 +1,12 @@
 output "load_balancer_public_ip" {
-  value = google_compute_instance.lb.network_interface.0.access_config.0.nat_ip
+  value = azurerm_public_ip.lb_pip.ip_address
 }
 output "db1_internal_ip" {
-  value = google_compute_instance.db[0].network_interface.0.network_ip
+  value = azurerm_network_interface.db_nic[0].ip_configuration[0].private_ip_address
 }
 output "db2_internal_ip" {
-  value = google_compute_instance.db[1].network_interface.0.network_ip
+  value = azurerm_network_interface.db_nic[1].ip_configuration[0].private_ip_address
 }
 output "db3_internal_ip" {
-  value = google_compute_instance.db[2].network_interface.0.network_ip
+  value = azurerm_network_interface.db_nic[2].ip_configuration[0].private_ip_address
 }

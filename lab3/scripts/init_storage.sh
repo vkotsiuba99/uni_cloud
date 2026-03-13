@@ -3,8 +3,8 @@ apt-get update
 # Install utilities without interactive prompts
 DEBIAN_FRONTEND=noninteractive apt-get install -y mdadm lvm2 glusterfs-server xfsprogs
 
-# 1. Create RAID 1 from two attached disks (/dev/sdb and /dev/sdc)
-yes | mdadm --create --verbose /dev/md0 --level=1 --raid-devices=2 /dev/sdb /dev/sdc
+# 1. Create RAID 1 from two attached disks (/dev/sdc and /dev/sdd)
+yes | mdadm --create --verbose /dev/md0 --level=1 --raid-devices=2 /dev/sdc /dev/sdd
 
 # 2. Configure LVM on top of RAID
 pvcreate /dev/md0

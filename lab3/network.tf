@@ -1,23 +1,50 @@
-resource "google_compute_network" "vpc_network" {
-  name                    = "lab3-network"
-  auto_create_subnetworks = true
+resource "azurerm_virtual_network" "vnet" {
+  name                = "lab3-vnet"
+  address_space       = ["10.2.0.0/16"]
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
 }
 
-resource "google_compute_firewall" "allow_internal_gluster" {
-  name    = "allow-internal-gluster"
-  network = google_compute_network.vpc_network.name
-  allow { protocol = "tcp" }
-  allow { protocol = "udp" }
-  allow { protocol = "icmp" }
-  source_ranges = ["10.128.0.0/9"] # GlusterFS requires open ports between nodes
+resource "azurerm_subnet" "subnet" {
+  name                 = "lab3-subnet"
+  resource_group_name  = azurerm_resource_group.rg.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = ["10.2.1.0/24"]
 }
 
-resource "google_compute_firewall" "allow_ssh" {
-  name    = "allow-ssh"
-  network = google_compute_network.vpc_network.name
-  allow {
-    protocol = "tcp"
-    ports    = ["22"]
+resource "azurerm_network_security_group" "nsg" {
+  name                = "lab3-nsg"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  # Allow SSH from anywhere (for lab simplicity)
+  security_rule {
+    name                       = "allow-ssh"
+    priority                   = 100
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "22"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
   }
-  source_ranges = ["0.0.0.0/0"]
+
+  # Allow all traffic within the virtual network for GlusterFS communication
+  security_rule {
+    name                       = "allow-vnet-all"
+    priority                   = 110
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "*"
+    source_port_range          = "*"
+    destination_port_range     = "*"
+    source_address_prefix      = "VirtualNetwork"
+    destination_address_prefix = "VirtualNetwork"
+  }
+}
+
+resource "azurerm_subnet_network_security_group_association" "subnet_nsg" {
+  subnet_id                 = azurerm_subnet.subnet.id
+  network_security_group_id = azurerm_network_security_group.nsg.id
 }
