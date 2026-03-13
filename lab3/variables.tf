@@ -1,6 +1,6 @@
 variable "machine_type" {
   description = "Azure VM size"
-  default     = "Standard_D2als_v6"
+  default     = "Standard_F1as_v7"
 }
 
 variable "student_name" {
