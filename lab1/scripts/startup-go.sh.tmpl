@@ -1,0 +1,620 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec > >(tee -a /var/log/startup-go.log) 2>&1
+
+STAGE="${stage}"
+ENABLE_MYSQL_ROUTER="${enable_mysql_router}"
+ENABLE_STORAGE_STACK="${enable_storage_stack}"
+NODE_NAME="${node_name}"
+NODE_PRIVATE_IP="${node_private_ip}"
+PEER_PRIVATE_IP="${peer_private_ip}"
+GLUSTER_PRIMARY="${gluster_primary}"
+GLUSTER_VOLUME_NAME="${gluster_volume_name}"
+GLUSTER_BRICK_PATH="${gluster_brick_path}"
+SHARED_MOUNT_PATH="${shared_mount_path}"
+DISK_DEVICE_A="${disk_device_a}"
+DISK_DEVICE_B="${disk_device_b}"
+
+GO_VERSION="${go_version}"
+APP_PORT="${app_port}"
+ROUTER_RW_PORT="${mysql_router_rw_port}"
+ROUTER_RO_PORT="${mysql_router_ro_port}"
+CLUSTER_PRIMARY_IP="${cluster_primary_ip}"
+CLUSTER_ADMIN_USER="${cluster_admin_user}"
+CLUSTER_ADMIN_PASSWORD="${cluster_admin_password}"
+DB_HOST_DEFAULT="${db_host}"
+DB_PORT_DEFAULT="${db_port}"
+DB_READ_PORT_DEFAULT="${db_read_port}"
+
+APP_DIR="/opt/lab1-go-app"
+APP_BIN="/usr/local/bin/lab1-go-app"
+ENV_FILE="/etc/default/lab1-go-app"
+SERVICE_FILE="/etc/systemd/system/lab1-go-app.service"
+
+export DEBIAN_FRONTEND=noninteractive
+export HOME=/root
+export GOPATH=/root/go
+export GOMODCACHE=/root/go/pkg/mod
+export PATH="/usr/local/go/bin:$PATH"
+
+mkdir -p "$GOMODCACHE"
+
+apt-get update -y
+
+packages=(ca-certificates curl tar)
+if [ "$ENABLE_MYSQL_ROUTER" = "true" ]; then
+  packages+=(mysql-router)
+fi
+if [ "$ENABLE_STORAGE_STACK" = "true" ]; then
+  packages+=(mdadm lvm2 glusterfs-server)
+fi
+apt-get install -y "${packages[@]}"
+
+if [ ! -x /usr/local/go/bin/go ] || ! /usr/local/go/bin/go version | grep -q "go$GO_VERSION"; then
+  rm -rf /usr/local/go
+  curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
+  tar -C /usr/local -xzf /tmp/go.tar.gz
+  rm -f /tmp/go.tar.gz
+fi
+
+id -u goapp >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin goapp
+
+mkdir -p "$APP_DIR"
+
+if [ "$ENABLE_STORAGE_STACK" = "true" ]; then
+  root_source="$(findmnt -n -o SOURCE /)"
+  root_disk_name="$(lsblk -no PKNAME "$root_source" 2>/dev/null || true)"
+  root_disk_path=""
+  if [ -n "$root_disk_name" ]; then
+    root_disk_path="/dev/$root_disk_name"
+  fi
+
+  detect_data_disks() {
+    local -a disks=()
+    local -a candidates=()
+    mapfile -t candidates < <(lsblk -dn -o NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}')
+
+    for disk in "${candidates[@]}"; do
+      if [ -n "$root_disk_path" ] && [ "$disk" = "$root_disk_path" ]; then
+        continue
+      fi
+      disks+=("$disk")
+    done
+
+    if [ "${#disks[@]}" -ge 2 ]; then
+      echo "${disks[0]} ${disks[1]}"
+      return 0
+    fi
+    return 1
+  }
+
+  DISK_A="$DISK_DEVICE_A"
+  DISK_B="$DISK_DEVICE_B"
+
+  if [ ! -b "$DISK_A" ] || [ ! -b "$DISK_B" ]; then
+    for _ in $(seq 1 60); do
+      if detected="$(detect_data_disks)"; then
+        DISK_A="$(echo "$detected" | awk '{print $1}')"
+        DISK_B="$(echo "$detected" | awk '{print $2}')"
+        break
+      fi
+      sleep 2
+    done
+  fi
+
+  if [ ! -b "$DISK_A" ] || [ ! -b "$DISK_B" ]; then
+    echo "Unable to resolve two storage disks for RAID setup."
+    exit 1
+  fi
+
+  if ! mdadm --detail /dev/md0 >/dev/null 2>&1; then
+    mdadm --create --verbose /dev/md0 --level=1 --raid-devices=2 "$DISK_A" "$DISK_B" --metadata=1.2 --force
+  fi
+
+  mkdir -p /etc/mdadm
+  touch /etc/mdadm/mdadm.conf
+  if ! grep -q "/dev/md0" /etc/mdadm/mdadm.conf; then
+    mdadm --detail --scan >> /etc/mdadm/mdadm.conf
+  fi
+  update-initramfs -u || true
+
+  if ! pvs --noheadings -o pv_name 2>/dev/null | tr -d ' ' | grep -q "^/dev/md0$"; then
+    pvcreate -ff -y /dev/md0
+  fi
+
+  if ! vgs vg_data >/dev/null 2>&1; then
+    vgcreate vg_data /dev/md0
+  fi
+
+  if ! lvs /dev/vg_data/lv_data >/dev/null 2>&1; then
+    lvcreate -l 100%FREE -n lv_data vg_data
+  fi
+
+  if ! blkid /dev/vg_data/lv_data >/dev/null 2>&1; then
+    mkfs.ext4 -F /dev/vg_data/lv_data
+  fi
+
+  mkdir -p "$GLUSTER_BRICK_PATH"
+  lv_uuid="$(blkid -s UUID -o value /dev/vg_data/lv_data)"
+  if ! grep -q "$lv_uuid" /etc/fstab; then
+    echo "UUID=$lv_uuid $GLUSTER_BRICK_PATH ext4 defaults,nofail 0 2" >> /etc/fstab
+  fi
+
+  mountpoint -q "$GLUSTER_BRICK_PATH" || mount "$GLUSTER_BRICK_PATH"
+  mkdir -p "$GLUSTER_BRICK_PATH/$GLUSTER_VOLUME_NAME"
+
+  systemctl enable glusterd
+  systemctl restart glusterd
+
+  if [ "$GLUSTER_PRIMARY" = "true" ]; then
+    for _ in $(seq 1 30); do
+      gluster peer probe "$PEER_PRIVATE_IP" || true
+      if gluster peer status | grep -q "$PEER_PRIVATE_IP"; then
+        break
+      fi
+      sleep 5
+    done
+
+    if ! gluster volume info "$GLUSTER_VOLUME_NAME" >/dev/null 2>&1; then
+      gluster volume create "$GLUSTER_VOLUME_NAME" replica 2 \
+        "$NODE_PRIVATE_IP:$GLUSTER_BRICK_PATH/$GLUSTER_VOLUME_NAME" \
+        "$PEER_PRIVATE_IP:$GLUSTER_BRICK_PATH/$GLUSTER_VOLUME_NAME" force
+    fi
+
+    gluster volume start "$GLUSTER_VOLUME_NAME" || true
+  else
+    for _ in $(seq 1 40); do
+      if gluster volume info "$GLUSTER_VOLUME_NAME" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 5
+    done
+  fi
+
+  mkdir -p "$SHARED_MOUNT_PATH"
+  if ! grep -q "localhost:/$GLUSTER_VOLUME_NAME $SHARED_MOUNT_PATH glusterfs" /etc/fstab; then
+    echo "localhost:/$GLUSTER_VOLUME_NAME $SHARED_MOUNT_PATH glusterfs defaults,_netdev 0 0" >> /etc/fstab
+  fi
+
+  shared_mounted=0
+  for _ in $(seq 1 40); do
+    if mountpoint -q "$SHARED_MOUNT_PATH"; then
+      shared_mounted=1
+      break
+    fi
+    mount "$SHARED_MOUNT_PATH" || true
+    sleep 3
+  done
+
+  if [ "$shared_mounted" -ne 1 ]; then
+    echo "Failed to mount shared GlusterFS path: $SHARED_MOUNT_PATH"
+    exit 1
+  fi
+else
+  mkdir -p "$SHARED_MOUNT_PATH"
+fi
+
+chown goapp:goapp "$SHARED_MOUNT_PATH" || true
+chmod 775 "$SHARED_MOUNT_PATH" || true
+
+if [ "$ENABLE_MYSQL_ROUTER" = "true" ]; then
+  id -u mysqlrouter >/dev/null 2>&1 || useradd --system --home /var/lib/mysqlrouter --shell /usr/sbin/nologin mysqlrouter
+  mkdir -p /etc/mysqlrouter
+
+  bootstrap_uri="$CLUSTER_ADMIN_USER:$CLUSTER_ADMIN_PASSWORD@$CLUSTER_PRIMARY_IP:3306"
+  router_bootstrapped=0
+  for _ in $(seq 1 40); do
+    if mysqlrouter --bootstrap "$bootstrap_uri" --directory /etc/mysqlrouter --user=mysqlrouter --force; then
+      router_bootstrapped=1
+      break
+    fi
+    sleep 10
+  done
+
+  if [ "$router_bootstrapped" -ne 1 ]; then
+    echo "MySQL Router bootstrap failed."
+    exit 1
+  fi
+
+  chown -R mysqlrouter:mysqlrouter /etc/mysqlrouter
+
+  cat > /etc/systemd/system/mysqlrouter.service <<'EOF'
+[Unit]
+Description=MySQL Router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mysqlrouter
+Group=mysqlrouter
+ExecStart=/usr/bin/mysqlrouter --config /etc/mysqlrouter/mysqlrouter.conf
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable mysqlrouter
+  systemctl restart mysqlrouter
+fi
+
+cat > "$APP_DIR/main.go" <<'EOF'
+package main
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"html/template"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"time"
+
+	_ "github.com/go-sql-driver/mysql"
+)
+
+type message struct {
+	ID        int
+	Message   string
+	CreatedAt time.Time
+}
+
+type sharedFile struct {
+	Name    string
+	Content string
+}
+
+type pageData struct {
+	Stage          string
+	NodeName       string
+	Hostname       string
+	PrimaryIP      string
+	DBEndpointRW   string
+	DBEndpointRO   string
+	ClusterPrimary string
+	SharedPath     string
+	GeneratedAt    string
+	Messages       []message
+	Files          []sharedFile
+}
+
+var htmlPage = template.Must(template.New("page").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lab 1 Go App - Vladyslav Kotsiuba IM-52mp</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 980px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { margin-bottom: 0.25rem; }
+    .meta { color: #444; margin-bottom: 1.25rem; }
+    table { border-collapse: collapse; width: 100%; margin-bottom: 1.25rem; }
+    th, td { border: 1px solid #ddd; padding: 0.5rem; text-align: left; vertical-align: top; }
+    th { background: #f5f5f5; }
+  </style>
+</head>
+<body>
+  <h1>AWS Infra Lab 1: Go + MySQL + Nginx</h1>
+  <h2>Student: Vladyslav Kotsiuba IM-52mp</h2>
+  <div class="meta">
+    <div><strong>Stage:</strong> {{ .Stage }}</div>
+    <div><strong>Node Name:</strong> {{ .NodeName }}</div>
+    <div><strong>Hostname:</strong> {{ .Hostname }}</div>
+    <div><strong>Primary IP:</strong> {{ .PrimaryIP }}</div>
+    <div><strong>Router RW:</strong> {{ .DBEndpointRW }}</div>
+    <div><strong>Router RO:</strong> {{ .DBEndpointRO }}</div>
+    <div><strong>Cluster Primary:</strong> {{ .ClusterPrimary }}</div>
+    <div><strong>Shared Path:</strong> {{ .SharedPath }}</div>
+    <div><strong>Rendered at:</strong> {{ .GeneratedAt }}</div>
+  </div>
+
+  <h2>DB Records</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Message</th>
+        <th>Created At (UTC)</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{ range .Messages }}
+      <tr>
+        <td>{{ .ID }}</td>
+        <td>{{ .Message }}</td>
+        <td>{{ .CreatedAt.UTC.Format "2006-01-02 15:04:05" }}</td>
+      </tr>
+      {{ else }}
+      <tr>
+        <td colspan="3">No records found.</td>
+      </tr>
+      {{ end }}
+    </tbody>
+  </table>
+
+  <h2>Shared Files</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>File</th>
+        <th>Content</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{ range .Files }}
+      <tr>
+        <td>{{ .Name }}</td>
+        <td><pre>{{ .Content }}</pre></td>
+      </tr>
+      {{ else }}
+      <tr>
+        <td colspan="2">No files found in shared storage.</td>
+      </tr>
+      {{ end }}
+    </tbody>
+  </table>
+</body>
+</html>`))
+
+func envOrDefault(key, fallback string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	return v
+}
+
+func buildDSN() string {
+	user := envOrDefault("DB_USER", "app_user")
+	pass := os.Getenv("DB_PASSWORD")
+	host := envOrDefault("DB_HOST", "127.0.0.1")
+	port := envOrDefault("DB_PORT", "6446")
+	name := envOrDefault("DB_NAME", "appdb")
+	return fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&timeout=5s&readTimeout=5s&writeTimeout=5s", user, pass, host, port, name)
+}
+
+func waitForDB(db *sql.DB, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := db.PingContext(ctx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		time.Sleep(2 * time.Second)
+	}
+
+	if lastErr == nil {
+		lastErr = errors.New("database ping timed out")
+	}
+	return lastErr
+}
+
+func primaryIPv4() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "unknown"
+	}
+
+	for _, iface := range ifaces {
+		if (iface.Flags&net.FlagUp) == 0 || (iface.Flags&net.FlagLoopback) != 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || ip.IsLoopback() {
+				continue
+			}
+			ip = ip.To4()
+			if ip != nil {
+				return ip.String()
+			}
+		}
+	}
+
+	return "unknown"
+}
+
+func writeHostMarker(sharedPath, hostname string) error {
+	content := fmt.Sprintf("hostname=%s\nupdated_at=%s\nstudent=Vladyslav Kotsiuba IM-52mp\n", hostname, time.Now().UTC().Format(time.RFC3339))
+	return os.WriteFile(filepath.Join(sharedPath, hostname+".txt"), []byte(content), 0o644)
+}
+
+func readSharedFiles(sharedPath string) ([]sharedFile, error) {
+	entries, err := os.ReadDir(sharedPath)
+	if err != nil {
+		return nil, err
+	}
+
+	files := make([]sharedFile, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(sharedPath, entry.Name()))
+		if err != nil {
+			continue
+		}
+		files = append(files, sharedFile{
+			Name:    entry.Name(),
+			Content: string(data),
+		})
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Name < files[j].Name
+	})
+	return files, nil
+}
+
+func main() {
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "unknown"
+	}
+
+	sharedPath := envOrDefault("SHARED_MOUNT_PATH", "/mnt/shared")
+	if err := os.MkdirAll(sharedPath, 0o755); err != nil {
+		log.Fatalf("prepare shared path: %v", err)
+	}
+
+	db, err := sql.Open("mysql", buildDSN())
+	if err != nil {
+		log.Fatalf("open database: %v", err)
+	}
+	defer db.Close()
+
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	if err := waitForDB(db, 2*time.Minute); err != nil {
+		log.Fatalf("database not ready: %v", err)
+	}
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if err := writeHostMarker(sharedPath, hostname); err != nil {
+			http.Error(w, fmt.Sprintf("shared write failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		rows, err := db.QueryContext(ctx, "SELECT id, message, created_at FROM messages ORDER BY id")
+		if err != nil {
+			http.Error(w, fmt.Sprintf("database query failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		records := make([]message, 0, 8)
+		for rows.Next() {
+			var rec message
+			if err := rows.Scan(&rec.ID, &rec.Message, &rec.CreatedAt); err != nil {
+				http.Error(w, fmt.Sprintf("database scan failed: %v", err), http.StatusInternalServerError)
+				return
+			}
+			records = append(records, rec)
+		}
+		if err := rows.Err(); err != nil {
+			http.Error(w, fmt.Sprintf("database rows failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		sharedFiles, err := readSharedFiles(sharedPath)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("shared read failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		dbHost := envOrDefault("DB_HOST", "127.0.0.1")
+		rwPort := envOrDefault("DB_PORT", "6446")
+		roPort := envOrDefault("DB_READ_PORT", "6447")
+
+		data := pageData{
+			Stage:          envOrDefault("APP_STAGE", "unknown"),
+			NodeName:       envOrDefault("NODE_NAME", "unknown"),
+			Hostname:       hostname,
+			PrimaryIP:      primaryIPv4(),
+			DBEndpointRW:   dbHost + ":" + rwPort,
+			DBEndpointRO:   dbHost + ":" + roPort,
+			ClusterPrimary: envOrDefault("CLUSTER_PRIMARY_IP", "unknown"),
+			SharedPath:     sharedPath,
+			GeneratedAt:    time.Now().UTC().Format(time.RFC3339),
+			Messages:       records,
+			Files:          sharedFiles,
+		}
+
+		if err := htmlPage.Execute(w, data); err != nil {
+			http.Error(w, fmt.Sprintf("template execution failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+	})
+
+	addr := ":" + envOrDefault("APP_PORT", "8080")
+	log.Printf("lab1 go app started on %s", addr)
+	log.Fatal(http.ListenAndServe(addr, nil))
+}
+EOF
+
+cat > "$APP_DIR/go.mod" <<'EOF'
+module lab1-go-app
+
+go 1.22
+
+require github.com/go-sql-driver/mysql v1.8.1
+EOF
+
+cd "$APP_DIR"
+/usr/local/go/bin/go mod tidy
+/usr/local/go/bin/go build -o "$APP_BIN" ./main.go
+
+cat > "$ENV_FILE" <<EOF
+DB_HOST=$DB_HOST_DEFAULT
+DB_PORT=$DB_PORT_DEFAULT
+DB_READ_PORT=$DB_READ_PORT_DEFAULT
+DB_NAME=${db_name}
+DB_USER=${db_user}
+DB_PASSWORD=${db_password}
+APP_PORT=$APP_PORT
+APP_STAGE=$STAGE
+CLUSTER_PRIMARY_IP=$CLUSTER_PRIMARY_IP
+SHARED_MOUNT_PATH=$SHARED_MOUNT_PATH
+NODE_NAME=$NODE_NAME
+EOF
+
+chown root:goapp "$ENV_FILE"
+chmod 640 "$ENV_FILE"
+
+cat > "$SERVICE_FILE" <<'EOF'
+[Unit]
+Description=Infra lab Go application
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=goapp
+Group=goapp
+WorkingDirectory=/opt/lab1-go-app
+EnvironmentFile=/etc/default/lab1-go-app
+ExecStart=/usr/local/bin/lab1-go-app
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+chown -R goapp:goapp "$APP_DIR"
+chown goapp:goapp "$APP_BIN"
+
+systemctl daemon-reload
+systemctl enable lab1-go-app
+systemctl restart lab1-go-app

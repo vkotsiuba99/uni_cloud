@@ -40,5 +40,23 @@ resource "azurerm_linux_virtual_machine" "db" {
     public_key = file("${path.module}/id_rsa.pub")
   }
 
-  custom_data = filebase64("${path.module}/scripts/init_db.sh")
+  custom_data = base64encode(templatefile("${path.module}/scripts/startup-mysql.sh.tmpl", {
+    cluster_mode             = "false" # Для 1 лаби кластер вимкнено
+    node_role                = "primary"
+    node_private_ip          = azurerm_network_interface.db_nic.private_ip_address
+    node_server_id           = "1"
+    stage                    = "Lab 1"
+    subnet_cidr              = "10.0.0.0/24" # Або інший, якщо у тебе змінений префікс підмережі
+    cluster_seed_list        = ""
+    cluster_primary_ip       = ""
+    cluster_secondary_ips    = ""
+    cluster_name             = ""
+    cluster_group_uuid       = ""
+    cluster_admin_user       = ""
+    cluster_admin_password   = ""
+    db_name                  = "appdb"
+    db_user                  = "app_user"
+    db_password              = var.db_password
+    mysql_shell_download_url = "https://dev.mysql.com/get/Downloads/MySQL-Shell/mysql-shell-8.0.36-linux-glibc2.28-x86-64bit.tar.gz"
+  }))
 }

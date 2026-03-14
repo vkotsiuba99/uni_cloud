@@ -49,8 +49,9 @@ resource "azurerm_linux_virtual_machine" "lb" {
     public_key = file("${path.module}/id_rsa.pub")
   }
 
-  custom_data = base64encode(templatefile("${path.module}/scripts/init_lb.sh", {
-    backend_ips = azurerm_network_interface.web_nic[*].ip_configuration[0].private_ip_address
+  custom_data = base64encode(templatefile("${path.module}/scripts/startup-nginx.sh.tmpl", {
+    app_upstreams = azurerm_network_interface.web_nic[*].private_ip_address
+    app_port      = "8080"
   }))
 
   depends_on = [azurerm_linux_virtual_machine.web]

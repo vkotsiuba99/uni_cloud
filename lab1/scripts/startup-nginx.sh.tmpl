@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec > >(tee -a /var/log/startup-nginx.log) 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update -y
+apt-get install -y nginx
+
+cat > /etc/nginx/sites-available/default <<'NGINX'
+upstream go_backend {
+%{ for ip in app_upstreams ~}
+    server ${ip}:${app_port} max_fails=3 fail_timeout=10s;
+%{ endfor ~}
+    keepalive 32;
+}
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    location / {
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_pass http://go_backend;
+    }
+}
+NGINX
+
+nginx -t
+systemctl enable nginx
+systemctl restart nginx

@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec > >(tee -a /var/log/startup-mysql.log) 2>&1
+
+CLUSTER_MODE="${cluster_mode}"
+NODE_ROLE="${node_role}"
+NODE_PRIVATE_IP="${node_private_ip}"
+NODE_SERVER_ID="${node_server_id}"
+STAGE="${stage}"
+
+SUBNET_CIDR="${subnet_cidr}"
+CLUSTER_SEED_LIST="${cluster_seed_list}"
+CLUSTER_PRIMARY_IP="${cluster_primary_ip}"
+CLUSTER_SECONDARY_IPS="${cluster_secondary_ips}"
+CLUSTER_NAME="${cluster_name}"
+CLUSTER_GROUP_UUID="${cluster_group_uuid}"
+CLUSTER_ADMIN_USER="${cluster_admin_user}"
+CLUSTER_ADMIN_PASSWORD="${cluster_admin_password}"
+
+APP_DB_NAME="${db_name}"
+APP_DB_USER="${db_user}"
+APP_DB_PASSWORD="${db_password}"
+
+MYSQL_SHELL_DOWNLOAD_URL="${mysql_shell_download_url}"
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update -y
+apt-get install -y mysql-server curl tar
+
+systemctl enable mysql
+
+if [ "$CLUSTER_MODE" != "true" ]; then
+  cat > /etc/mysql/mysql.conf.d/z-lab1-basic.cnf <<EOF
+[mysqld]
+bind-address = 0.0.0.0
+EOF
+
+  systemctl restart mysql
+
+  for _ in $(seq 1 50); do
+    if mysqladmin --protocol=socket -u root ping --silent; then
+      break
+    fi
+    sleep 2
+  done
+
+  mysql --protocol=socket -u root <<SQL
+CREATE DATABASE IF NOT EXISTS \`$APP_DB_NAME\`;
+CREATE USER IF NOT EXISTS '$APP_DB_USER'@'%' IDENTIFIED BY '$APP_DB_PASSWORD';
+GRANT ALL PRIVILEGES ON \`$APP_DB_NAME\`.* TO '$APP_DB_USER'@'%';
+FLUSH PRIVILEGES;
+
+CREATE TABLE IF NOT EXISTS \`$APP_DB_NAME\`.messages (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  message VARCHAR(255) NOT NULL UNIQUE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO \`$APP_DB_NAME\`.messages (message) VALUES ('Seed row #1 from Lab 1 (Vladyslav Kotsiuba IM-52mp)')
+ON DUPLICATE KEY UPDATE message = VALUES(message);
+
+INSERT INTO \`$APP_DB_NAME\`.messages (message) VALUES ('Seed row #2 from Lab 1 (Vladyslav Kotsiuba IM-52mp)')
+ON DUPLICATE KEY UPDATE message = VALUES(message);
+SQL
+
+  exit 0
+fi
+
+install_mysql_shell() {
+  if command -v mysqlsh >/dev/null 2>&1; then
+    return
+  fi
+
+  if apt-cache show mysql-shell >/dev/null 2>&1; then
+    apt-get install -y mysql-shell || true
+  fi
+
+  if command -v mysqlsh >/dev/null 2>&1; then
+    return
+  fi
+
+  curl -fsSL "$MYSQL_SHELL_DOWNLOAD_URL" -o /tmp/mysql-shell.tgz
+  rm -rf /opt/mysql-shell
+  mkdir -p /opt/mysql-shell
+  tar -xzf /tmp/mysql-shell.tgz -C /opt/mysql-shell --strip-components=1
+  ln -sf /opt/mysql-shell/bin/mysqlsh /usr/local/bin/mysqlsh
+  rm -f /tmp/mysql-shell.tgz
+}
+
+install_mysql_shell
+
+cat > /etc/mysql/mysql.conf.d/z-lab1-cluster.cnf <<EOF
+[mysqld]
+bind-address = 0.0.0.0
+report_host = $NODE_PRIVATE_IP
+server_id = $NODE_SERVER_ID
+log_bin = mysql-bin
+binlog_format = ROW
+binlog_checksum = NONE
+gtid_mode = ON
+enforce_gtid_consistency = ON
+master_info_repository = TABLE
+relay_log_info_repository = TABLE
+relay_log_recovery = ON
+transaction_write_set_extraction = XXHASH64
+plugin_load_add = group_replication.so
+loose-group_replication_group_name = "$CLUSTER_GROUP_UUID"
+loose-group_replication_start_on_boot = OFF
+loose-group_replication_bootstrap_group = OFF
+loose-group_replication_local_address = "$NODE_PRIVATE_IP:33061"
+loose-group_replication_group_seeds = "$CLUSTER_SEED_LIST"
+loose-group_replication_ip_allowlist = "$SUBNET_CIDR,127.0.0.1/8"
+loose-group_replication_single_primary_mode = ON
+loose-group_replication_enforce_update_everywhere_checks = OFF
+EOF
+
+systemctl restart mysql
+
+for _ in $(seq 1 50); do
+  if mysqladmin --protocol=socket -u root ping --silent; then
+    break
+  fi
+  sleep 2
+done
+
+mysql --protocol=socket -u root <<SQL
+SET SQL_LOG_BIN = 0;
+CREATE USER IF NOT EXISTS '$CLUSTER_ADMIN_USER'@'%' IDENTIFIED BY '$CLUSTER_ADMIN_PASSWORD';
+GRANT ALL PRIVILEGES ON *.* TO '$CLUSTER_ADMIN_USER'@'%' WITH GRANT OPTION;
+CREATE USER IF NOT EXISTS '$APP_DB_USER'@'%' IDENTIFIED BY '$APP_DB_PASSWORD';
+GRANT ALL PRIVILEGES ON \`$APP_DB_NAME\`.* TO '$APP_DB_USER'@'%';
+FLUSH PRIVILEGES;
+SET SQL_LOG_BIN = 1;
+SQL
+
+wait_remote_mysql() {
+  remote_ip="$1"
+  for _ in $(seq 1 60); do
+    if mysqladmin --connect-timeout=5 --host="$remote_ip" --user="$CLUSTER_ADMIN_USER" --password="$CLUSTER_ADMIN_PASSWORD" ping --silent; then
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
+
+if [ "$NODE_ROLE" = "primary" ]; then
+  for ip in $(echo "$CLUSTER_SECONDARY_IPS" | tr ',' ' '); do
+    wait_remote_mysql "$ip"
+  done
+
+  SECONDARY_JS_ARRAY=""
+  for ip in $(echo "$CLUSTER_SECONDARY_IPS" | tr ',' ' '); do
+    SECONDARY_JS_ARRAY="$SECONDARY_JS_ARRAY, \"$ip\""
+  done
+
+  cat > /tmp/lab1-cluster-init.js <<EOF
+shell.options.useWizards = false;
+var adminUser = "$CLUSTER_ADMIN_USER";
+var adminPass = "$CLUSTER_ADMIN_PASSWORD";
+var clusterName = "$CLUSTER_NAME";
+var primaryIp = "$CLUSTER_PRIMARY_IP";
+var instances = ["$CLUSTER_PRIMARY_IP"$SECONDARY_JS_ARRAY];
+
+for (var i = 0; i < instances.length; i++) {
+  var uri = adminUser + ":" + adminPass + "@" + instances[i] + ":3306";
+  try {
+    dba.configureInstance(uri, {interactive: false, restart: true});
+  } catch (e) {
+    print("configureInstance warning for " + instances[i] + ": " + e.message);
+  }
+}
+
+var cluster;
+try {
+  cluster = dba.getCluster(clusterName);
+} catch (e) {
+  cluster = dba.createCluster(clusterName);
+}
+
+for (var i = 0; i < instances.length; i++) {
+  if (instances[i] === primaryIp) {
+    continue;
+  }
+  var memberUri = adminUser + ":" + adminPass + "@" + instances[i] + ":3306";
+  try {
+    cluster.addInstance(memberUri, {recoveryMethod: "clone"});
+  } catch (e) {
+    print("addInstance warning for " + instances[i] + ": " + e.message);
+  }
+}
+EOF
+
+  cluster_ready=0
+  for _ in $(seq 1 20); do
+    if mysqlsh --uri "$CLUSTER_ADMIN_USER:$CLUSTER_ADMIN_PASSWORD@127.0.0.1:3306" --js --file /tmp/lab1-cluster-init.js; then
+      cluster_ready=1
+      break
+    fi
+    sleep 10
+  done
+
+  if [ "$cluster_ready" -ne 1 ]; then
+    echo "MySQL InnoDB Cluster initialization failed."
+    exit 1
+  fi
+
+  mysql --host=127.0.0.1 --user="$CLUSTER_ADMIN_USER" --password="$CLUSTER_ADMIN_PASSWORD" <<SQL
+CREATE DATABASE IF NOT EXISTS \`$APP_DB_NAME\`;
+CREATE TABLE IF NOT EXISTS \`$APP_DB_NAME\`.messages (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  message VARCHAR(255) NOT NULL UNIQUE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO \`$APP_DB_NAME\`.messages (message) VALUES ('Seed row #1 from Lab 1 ($${STAGE})')
+ON DUPLICATE KEY UPDATE message = VALUES(message);
+
+INSERT INTO \`$APP_DB_NAME\`.messages (message) VALUES ('Seed row #2 from Lab 1 ($${STAGE})')
+ON DUPLICATE KEY UPDATE message = VALUES(message);
+SQL
+fi
